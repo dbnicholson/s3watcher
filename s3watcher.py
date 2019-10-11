@@ -18,16 +18,15 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+import asyncio
 import boto3
 from collections import namedtuple
-from gi.repository import GLib, Gio
 import json
 import logging
 from operator import attrgetter
 import os
 import signal
 import sys
-import threading
 from urllib.parse import unquote_plus
 
 
@@ -43,22 +42,8 @@ class S3Watcher(object):
     """Watch images S3 bucket
 
     Cache the objects in the images S3 bucket and make the listing
-    available over DBus.
+    available over RPC.
     """
-    BUS = 'com.endlessm.S3Listing'
-    PATH = '/com/endlessm/S3Listing'
-    INTERFACE = 'com.endlessm.S3Listing'
-    INTROSPECTION_XML = \
-        """\
-        <node>
-          <interface name="{interface}">
-            <method name="Objects">
-              <arg name="objects" direction="out" type="a(stt)"/>
-            </method>
-          </interface>
-        </node>
-        """.format(interface=INTERFACE)
-
     # The SQS queue is not guaranteed to deliver all events, and S3
     # doesn't deliver events for bucket lifecycle events, so refresh the
     # cached objects periodically.
@@ -70,11 +55,12 @@ class S3Watcher(object):
     # are received. This also keeps the SQS queue from growing large.
     FLUSH_INTERVAL = 30
 
-    def __init__(self, bucket, queue_url=None, region=None):
-        if region is None:
-            region = 'us-east-1'
-        session = boto3.session.Session(region_name=region)
+    def __init__(self, bucket, queue_url=None, region='us-east-1',
+                 addr='127.0.0.1', port=7979):
+        self.addr = addr
+        self.port = port
 
+        session = boto3.session.Session(region_name=region)
         self.s3 = session.resource('s3')
         self.bucket = self.s3.Bucket(bucket)
 
@@ -91,31 +77,24 @@ class S3Watcher(object):
             self.sqs = None
             self.queue = None
 
-        # DBus registration ID
-        self.bus_id = None
-
         # Object listing cache and associated locks
         self.objects = {}
-        self.objects_lock = threading.Lock()
-        self.queue_lock = threading.Lock()
+        self.objects_lock = asyncio.Lock()
+        self.queue_lock = asyncio.Lock()
 
-        logger.info('Starting initial enumeration')
-        self._refresh_all_objects()
-        self._flush_queue()
-        logger.info('Finished initial enumeration')
+        # Server task
+        self.server = None
 
         # Setup periodic tasks to refresh the object cache and process
         # events
-        self._refresh_source_id = None
-        self._flush_source_id = None
-        self.setup_sources()
+        self._refresh_task = None
+        self._flush_task = None
 
     def __del__(self):
-        # Drop bus ownership and remove timeout sources when deleted
-        self.remove_dbus()
-        self.remove_sources()
+        # Remove tasks when deleted
+        self.remove_tasks()
 
-    def _refresh_all_objects(self):
+    async def _refresh_all_objects(self):
         """Fully refresh object cache
 
         Get a full listing from S3 and replace the object cache with it.
@@ -124,14 +103,14 @@ class S3Watcher(object):
         tmpobjects = {}
         for obj in self.bucket.objects.all():
             self._add_object(tmpobjects, obj)
-        with self.objects_lock:
+        async with self.objects_lock:
             self.objects = tmpobjects
 
     # Event information created from SQS S3 records
     ObjectEvent = namedtuple('ObjectEvent',
                              ['name', 'key', 'created', 'sequence'])
 
-    def _flush_queue(self, wait_seconds=3):
+    async def _flush_queue(self, wait_seconds=3):
         """Receive and process all messages in SQS queue
 
         By default, a "long poll" is done to try to ensure that all
@@ -146,7 +125,7 @@ class S3Watcher(object):
             return
 
         # Lock the queue in case there's already another reader
-        with self.queue_lock:
+        async with self.queue_lock:
             # SQS can deliver the messages out of order, so get them all
             # and sort them below
             all_messages = []
@@ -172,7 +151,7 @@ class S3Watcher(object):
 
             # Sort the events by sequence and process them
             sorted_events = sorted(events, key=attrgetter('sequence'))
-            self._process_events(sorted_events)
+            await self._process_events(sorted_events)
 
             # Delete all the messages since they've been processed
             for msg in all_messages:
@@ -220,9 +199,9 @@ class S3Watcher(object):
 
         return self.ObjectEvent(event_name, key, created, sequence)
 
-    def _process_events(self, events):
+    async def _process_events(self, events):
         """Add or remove objects from cache based on events"""
-        with self.objects_lock:
+        async with self.objects_lock:
             for event in events:
                 logger.info('Received %s event for "%s"', event.name,
                             event.key)
@@ -256,99 +235,69 @@ class S3Watcher(object):
         logger.debug('Removing object "%s"', key)
         objects.pop(key, None)
 
-    def _method_call(self, connection, sender, object_path, interface_name,
-                     method_name, parameters, invocation):
-        """DBus method call handler"""
-        if object_path != self.PATH:
-            raise Exception('Unrecognized object path "{}"'.format(object_path))
 
-        if method_name == 'Objects':
-            # Get any outstanding events with a short poll
-            self._flush_queue(wait_seconds=0)
-            listing = []
-            for key, value in sorted(self.objects.items()):
-                listing.append((key, value[0], value[1]))
-            ret = GLib.Variant.new_tuple(
-                GLib.Variant('a(stt)', listing)
-            )
-            invocation.return_value(ret)
-        else:
-            raise Exception('Unrecognized method "{}"'.format(method_name))
+    async def handle_connection(self, reader, writer):
+        writer.close()
 
-    def setup_dbus(self, bus_type=Gio.BusType.SYSTEM,
-                   name_lost_handler=None):
-        """Setup DBus connection"""
-        logger.info('Claiming bus %s', self.BUS)
-        self.bus_id = Gio.bus_own_name(bus_type,
-                                       self.BUS,
-                                       Gio.BusNameOwnerFlags.NONE,
-                                       self._register_object,
-                                       None,
-                                       name_lost_handler)
-
-    def remove_dbus(self):
-        """Drop DBus bus name"""
-        if self.bus_id is not None:
-            logger.info('Dropping bus %s', self.BUS)
-            Gio.bus_unown_name(self.bus_id)
-
-    def _register_object(self, connection, name):
-        """Register object for DBus path"""
-        logger.info('Registering object for %s', self.PATH)
-        node_info = Gio.DBusNodeInfo.new_for_xml(self.INTROSPECTION_XML)
-        Gio.DBusConnection.register_object(connection,
-                                           self.PATH,
-                                           node_info.interfaces[0],
-                                           self._method_call,
-                                           None,
-                                           None)
-
-    def setup_sources(self):
+    def setup_tasks(self):
         """Setup cache handling tasks"""
-        self._setup_refresh_source()
-        self._setup_flush_source()
+        self._setup_refresh_task()
+        self._setup_flush_task()
 
-    def remove_sources(self):
+    def remove_tasks(self):
         """Remove cache handling tasks"""
-        self._remove_refresh_soure()
-        self._remove_flush_source()
+        self._remove_refresh_task()
+        self._remove_flush_task()
 
-    def _setup_refresh_source(self):
-        logger.debug('Enabling refresh source')
-        self._refresh_source_id = GLib.timeout_add_seconds(
-            self.REFRESH_INTERVAL, self._handle_refresh_timeout)
+    def _setup_refresh_task(self):
+        logger.debug('Enabling refresh task')
+        self._refresh_task = asyncio.create_task(self._handle_refresh_task())
 
-    def _handle_refresh_timeout(self):
-        logger.debug('Handling refresh timeout')
-        self._refresh_all_objects()
-        self._setup_refresh_source()
-        return False
+    async def _handle_refresh_task(self):
+        await asyncio.sleep(self.REFRESH_INTERVAL)
+        logger.debug('Handling refresh task')
+        await self._refresh_all_objects()
+        self._setup_refresh_task()
 
-    def _remove_refresh_source(self):
-        if self._refresh_source_id is not None:
-            logger.debug('Removing refresh source')
-            GLib.source_remove(self._refresh_source_id)
-            self._refresh_source_id = None
+    def _remove_refresh_task(self):
+        if self._refresh_task is not None:
+            logger.debug('Removing refresh task')
+            self._refresh_task.cancel()
+            self._refresh_task = None
 
-    def _setup_flush_source(self):
-        if self.queue is not None:
-            logger.debug('Enabling flush source')
-            self._flush_source_id = GLib.timeout_add_seconds(
-                self.FLUSH_INTERVAL, self._handle_flush_timeout)
-        else:
-            self._flush_source_id = None
+    def _setup_flush_task(self):
+        if self.queue is None:
+            self._flush_task = None
+            return
 
-    def _handle_flush_timeout(self):
-        logger.debug('Handling flush timeout')
-        self._flush_queue()
-        self._setup_flush_source()
-        return False
+        logger.debug('Enabling flush task')
+        self._flush_task = asyncio.create_task(self._handle_flush_task())
 
-    def _remove_flush_source(self):
-        if self._flush_source_id is not None:
-            logger.debug('Removing flush source')
-            GLib.source_remove(self._flush_source_id)
-            self._flush_source_id = None
+    async def _handle_flush_task(self):
+        await asyncio.sleep(FLUSH_INTERVAL)
+        logger.debug('Handling flush task')
+        await self._flush_queue()
+        self._setup_flush_task()
+
+    def _remove_flush_task(self):
+        if self._flush_task is not None:
+            logger.debug('Removing flush task')
+            self._flush_task.cancel()
+            self._flush_task = None
+
+    async def run(self):
+        logger.info('Starting initial enumeration')
+        await self._refresh_all_objects()
+        await self._flush_queue()
+        logger.info('Finished initial enumeration')
+
+        self.setup_tasks()
+
+        server = await asyncio.start_server(self.handle_connection,
+                                            self.addr,
+                                            self.port)
+        async with server:
+            await server.serve_forever()
 
 
 def main():
@@ -371,29 +320,8 @@ def main():
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
-    server = S3Watcher(args.bucket, args.queue_url, args.region)
-    loop = GLib.MainLoop()
-
-    # Gracefully exit when killed
-    def sigterm_handler(signal, frame):
-        logger.info('Received SIGTERM, exiting')
-        loop.quit()
-
-    signal.signal(signal.SIGTERM, sigterm_handler)
-
-    # Fail if the bus name is lost
-    def name_lost_handler(connection, name):
-        logger.error('Bus name %s lost, exiting', name)
-        sys.exit(1)
-
-    # Initialize DBus
-    bus_type = Gio.BusType.SESSION if args.session else Gio.BusType.SYSTEM
-    server.setup_dbus(bus_type, name_lost_handler)
-
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        logger.info('Received keyboard interrupt, exiting')
+    watcher = S3Watcher(args.bucket, args.queue_url, args.region)
+    asyncio.run(watcher.run())
 
 
 if __name__ == '__main__':

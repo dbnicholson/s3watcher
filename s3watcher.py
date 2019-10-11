@@ -21,8 +21,10 @@
 import asyncio
 import boto3
 from collections import namedtuple
+from enum import IntEnum
 import json
 import logging
+import msgpack
 from operator import attrgetter
 import os
 import signal
@@ -36,6 +38,72 @@ logger = logging.getLogger(os.path.basename(__file__))
 class S3WatcherError(Exception):
     """Errors for S3Watcher class"""
     pass
+
+
+# The protocol is pretty simple. The message consists of a header and
+# body. The body is the message payload in MessagePack format. The
+# header begins with a single byte version number and then 4 bytes
+# containing the payload size in big endian.
+#
+# The format of the body is a tuple of (msgtype, parameters). msgtype is
+# integer enumeration of the message type. Parameters is an optional
+# dictionary. The keys and values in the dictionary are dependent on the
+# message type.
+MESSAGE_VERSION = 0
+MESSAGE_HEADER_SIZE = 5
+
+
+class MessageType(IntEnum):
+    ERROR = 0
+    OBJECTS = 1
+
+
+async def write_message(writer, data):
+    body = msgpack.packb(data, use_bin_type=True)
+    size = len(body)
+    header = MESSAGE_VERSION.to_bytes(1, 'big') + size.to_bytes(4, 'big')
+    writer.write(header + body)
+    await writer.drain()
+
+
+async def write_error(writer, error):
+    await write_message(writer, (MessageType.ERROR, error))
+
+async def read_message(reader):
+    header = await reader.readexactly(MESSAGE_HEADER_SIZE)
+    version = header[0]
+    if version != MESSAGE_VERSION:
+        raise S3WatcherError('Protocol version {} not supported'
+                             .format(version))
+    size = int.from_bytes(header[1:], 'big')
+
+    unpacker = msgpack.Unpacker(use_list=False, raw=False)
+    while size > 0:
+        buf = await reader.read(size)
+        size -= len(buf)
+        unpacker.feed(buf)
+
+    return unpacker.unpack()
+
+async def validate_message(writer, data):
+    if not isinstance(data, tuple):
+        logger.error('message is not tuple')
+        await write_error(writer, 'message is not tuple')
+        return False
+
+    if not isinstance(data[0], int):
+        logger.error('message member 0 is not an integer')
+        await write_error(writer, 'message member 0 is not an integer')
+        return False
+
+    try:
+        msgtype = MessageType(data[0])
+    except ValueError:
+        logger.error('unknown message type %d', data[0])
+        await write_error(writer, 'unknown message type %d' % data[0])
+        return False
+
+    return True
 
 
 class S3Watcher(object):
@@ -235,8 +303,25 @@ class S3Watcher(object):
         logger.debug('Removing object "%s"', key)
         objects.pop(key, None)
 
+    async def _handle_objects(self, writer, data):
+        # Get any outstanding events with a short poll
+        await self._flush_queue(wait_seconds=0)
+        listing = []
+        for key, value in sorted(self.objects.items()):
+            listing.append((key, value[0], value[1]))
+        await write_message(writer, ('objects', listing))
 
     async def handle_connection(self, reader, writer):
+        data = await read_message(reader)
+        if await validate_message(writer, data):
+            msgtype = data[0]
+            logger.debug('received message type %s', msgtype)
+            if msgtype == MessageType.OBJECTS:
+                await self._handle_objects(writer, data)
+            else:
+                logger.error('unknown message type %s', method)
+                await write_error(writer,
+                                  'unknown message type {}'.format(method))
         writer.close()
 
     def setup_tasks(self):

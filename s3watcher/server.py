@@ -1,109 +1,13 @@
-#!/usr/bin/python3
-
-# s3watcher - Watch S3 bucket contents with RPC
-#
-# Copyright (C) 2019  Dan Nicholson <nicholson@endlessm.com>
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
 import asyncio
 import boto3
 from collections import namedtuple
-from enum import IntEnum
 import json
-import logging
-import msgpack
 from operator import attrgetter
-import os
-import signal
-import sys
 from urllib.parse import unquote_plus
 
-
-logger = logging.getLogger(os.path.basename(__file__))
-
-
-class S3WatcherError(Exception):
-    """Errors for S3Watcher class"""
-    pass
-
-
-# The protocol is pretty simple. The message consists of a header and
-# body. The body is the message payload in MessagePack format. The
-# header begins with a single byte version number and then 4 bytes
-# containing the payload size in big endian.
-#
-# The format of the body is a tuple of (msgtype, parameters). msgtype is
-# integer enumeration of the message type. Parameters is an optional
-# dictionary. The keys and values in the dictionary are dependent on the
-# message type.
-MESSAGE_VERSION = 0
-MESSAGE_HEADER_SIZE = 5
-
-
-class MessageType(IntEnum):
-    ERROR = 0
-    OBJECTS = 1
-
-
-async def write_message(writer, data):
-    body = msgpack.packb(data, use_bin_type=True)
-    size = len(body)
-    header = MESSAGE_VERSION.to_bytes(1, 'big') + size.to_bytes(4, 'big')
-    writer.write(header + body)
-    await writer.drain()
-
-
-async def write_error(writer, error):
-    await write_message(writer, (MessageType.ERROR, error))
-
-async def read_message(reader):
-    header = await reader.readexactly(MESSAGE_HEADER_SIZE)
-    version = header[0]
-    if version != MESSAGE_VERSION:
-        raise S3WatcherError('Protocol version {} not supported'
-                             .format(version))
-    size = int.from_bytes(header[1:], 'big')
-
-    unpacker = msgpack.Unpacker(use_list=False, raw=False)
-    while size > 0:
-        buf = await reader.read(size)
-        size -= len(buf)
-        unpacker.feed(buf)
-
-    return unpacker.unpack()
-
-async def validate_message(writer, data):
-    if not isinstance(data, tuple):
-        logger.error('message is not tuple')
-        await write_error(writer, 'message is not tuple')
-        return False
-
-    if not isinstance(data[0], int):
-        logger.error('message member 0 is not an integer')
-        await write_error(writer, 'message member 0 is not an integer')
-        return False
-
-    try:
-        msgtype = MessageType(data[0])
-    except ValueError:
-        logger.error('unknown message type %d', data[0])
-        await write_error(writer, 'unknown message type %d' % data[0])
-        return False
-
-    return True
+from .log import logger
+from .message import (MessageType, write_message, write_error, read_message,
+                      validate_message)
 
 
 class S3Watcher(object):
@@ -319,9 +223,9 @@ class S3Watcher(object):
             if msgtype == MessageType.OBJECTS:
                 await self._handle_objects(writer, data)
             else:
-                logger.error('unknown message type %s', method)
+                logger.error('unknown message type %s', msgtype)
                 await write_error(writer,
-                                  'unknown message type {}'.format(method))
+                                  'unknown message type {}'.format(msgtype))
         writer.close()
 
     def setup_tasks(self):
@@ -359,7 +263,7 @@ class S3Watcher(object):
         self._flush_task = asyncio.create_task(self._handle_flush_task())
 
     async def _handle_flush_task(self):
-        await asyncio.sleep(FLUSH_INTERVAL)
+        await asyncio.sleep(self.FLUSH_INTERVAL)
         logger.debug('Handling flush task')
         await self._flush_queue()
         self._setup_flush_task()
@@ -383,31 +287,3 @@ class S3Watcher(object):
                                             self.port)
         async with server:
             await server.serve_forever()
-
-
-def main():
-    from argparse import ArgumentParser
-
-    aparser = ArgumentParser(
-        description='Image S3 bucket watch service')
-    aparser.add_argument('bucket', metavar='BUCKET',
-                         help='S3 bucket name')
-    aparser.add_argument('queue_url', metavar='QUEUE', nargs='?',
-                         help='SQS queue URL')
-    aparser.add_argument('--region', help='S3 region')
-    aparser.add_argument('--session', action='store_true',
-                         help='use DBus session bus')
-    aparser.add_argument('--debug', action='store_true',
-                         help='enable debug messages')
-    args = aparser.parse_args()
-
-    logging.basicConfig(level=logging.INFO)
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-
-    watcher = S3Watcher(args.bucket, args.queue_url, args.region)
-    asyncio.run(watcher.run())
-
-
-if __name__ == '__main__':
-    main()

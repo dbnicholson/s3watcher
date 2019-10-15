@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser
+import asyncio
+import logging
+from pprint import pprint
+from s3watcher.client import S3WatcherClient
+import sys
+
+
+async def run(args):
+    client = S3WatcherClient(args.address, args.port)
+    method = getattr(client, args.request.lower(), None)
+    if method is None:
+        print('Error: No method for request', args.request,
+              'in S3WatcherClient', file=sys.stderr)
+        sys.exit(1)
+    await client.connect()
+    method_args = dict([p.split('=') for p in args.params])
+    data = await method(**method_args)
+    pprint(data)
+
+
+def main():
+    aparser = ArgumentParser(description='S3Watcher client')
+    aparser.add_argument('request', metavar='REQUEST',
+                         help='request to perform')
+    aparser.add_argument('params', metavar='PARAMS',
+                         nargs='*', default=[],
+                         help='request parameters')
+    aparser.add_argument('-a', '--address', default='127.0.0.1',
+                         help='server address')
+    aparser.add_argument('-p', '--port', type=int, default=7979,
+                         help='server port')
+    args = aparser.parse_args()
+
+    logging.basicConfig()
+    asyncio.run(run(args))
+
+
+if __name__ == '__main__':
+    main()
